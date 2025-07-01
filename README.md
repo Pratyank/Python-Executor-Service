@@ -253,9 +253,3 @@ This take-home challenge implementation includes:
 - Lightweight Docker container
 - Complete documentation with examples
 - Deployed and tested on Google Cloud Run
-
-**Estimated completion time**: 2-3 hours (including testing and documentation)
-
-## Support
-
-For issues or questions, please check the error messages in the API responses. The service provides detailed error information for debugging.
