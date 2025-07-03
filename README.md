@@ -431,21 +431,11 @@ This ensures compatibility across different deployment environments.
 - `stdout`: Print statements and console output (separate from result)
 - Error handling: Validation errors vs. execution errors
 
-## 📝 License
-
-[Add your license information here]
-
-## 🤝 Contributing
-
-[Add contribution guidelines here]
-
 ---
 
 ## 📋 Take-Home Challenge Submission
-
-**Repository**: [Your GitHub Repository URL]
-**Cloud Run URL**: [Your Cloud Run Service URL]  
-**Time to Complete**: [Your estimated time - for reference only]
+**Cloud Run URL**: https://python-executor-551536072450.us-central1.run.app/execute
+**Time to Complete**: [4 hours]
 
 ### Verification Checklist
 - ✅ Single `docker run` command starts service locally
@@ -458,7 +448,3 @@ This ensures compatibility across different deployment environments.
 - ✅ Flask framework used for API
 - ✅ Docker image optimized for size and efficiency
 - ✅ Comprehensive documentation with cURL examples
-
----
-
-**Note**: This implementation provides a secure, scalable solution for arbitrary Python code execution with comprehensive security measures and robust error handling.
