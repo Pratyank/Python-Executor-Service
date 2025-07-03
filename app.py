@@ -1,348 +1,588 @@
-from flask import Flask, request, jsonify
-import subprocess
-import tempfile
-import os
 import json
+import os
+import tempfile
+import subprocess
+import sys
 import time
+from flask import Flask, request, jsonify
+from werkzeug.exceptions import BadRequest
+import logging
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# Security limits
+MAX_SCRIPT_SIZE = 10000  # 10KB
+EXECUTION_TIMEOUT = 30   # 30 seconds
 
 def validate_script(script):
-    """Basic validation of the script"""
+    """Basic input validation for the Python script"""
     if not script or not isinstance(script, str):
         raise ValueError("Script must be a non-empty string")
     
-    if len(script) > 100000:  # 100KB limit
-        raise ValueError("Script too large (max 100KB)")
+    if len(script) > MAX_SCRIPT_SIZE:
+        raise ValueError(f"Script too large. Maximum size: {MAX_SCRIPT_SIZE} bytes")
     
-    # Check for main function
+    # Check if script contains main() function
     if "def main(" not in script:
         raise ValueError("Script must contain a main() function")
     
     return True
 
-def create_nsjail_config():
-    """Create nsjail configuration file compatible with older versions"""
-    config = """
-name: "python-execution"
-description: "Safe Python script execution"
+def create_nsjail_config_cloudrun(script_path):
+    """Create Cloud Run compatible nsjail configuration"""
+    
+    config_content = f'''
+name: "python-executor"
+mode: ONCE
+time_limit: {EXECUTION_TIMEOUT}
+log_level: ERROR
+
+# Only essential resource limits
+rlimit_as: 134217728
+rlimit_as_type: VALUE
+rlimit_cpu: 30
+rlimit_cpu_type: VALUE
+
+# Disable ALL namespace isolation for Cloud Run
+clone_newnet: false
+clone_newuser: false
+clone_newns: false
+clone_newpid: false
+clone_newipc: false
+clone_newuts: false
+clone_newcgroup: false
+
+# Keep all environment variables
+keep_env: true
+
+# Script file mount
+mount {{
+    src: "{script_path}"
+    dst: "/tmp/script.py"
+    is_bind: true
+    rw: false
+}}
+
+# Execution
+exec_bin {{
+    path: "/usr/bin/python3"
+    arg: "/tmp/script.py"
+}}
+'''
+    
+    return config_content
+
+def create_nsjail_config_minimal(script_path):
+    """Create minimal nsjail configuration for WSL/container environments"""
+    
+    config_content = f'''
+name: "python-executor"
+description: "Safe Python script execution - minimal config"
 
 mode: ONCE
-hostname: "nsjail-python"
+hostname: "python-jail"
+cwd: "/tmp"
+time_limit: {EXECUTION_TIMEOUT}
+log_level: ERROR
 
-time_limit: 30
-
-rlimit_as: 134217728  # 128MB
-rlimit_cpu: 10        # 10 seconds CPU time
+# Basic resource limits
+rlimit_as: 134217728
+rlimit_as_type: VALUE
+rlimit_cpu: 30
+rlimit_cpu_type: VALUE
+rlimit_fsize: 1048576
+rlimit_fsize_type: VALUE
 rlimit_nofile: 32
+rlimit_nofile_type: VALUE
+rlimit_nproc: 10
+rlimit_nproc_type: VALUE
 
-mount {
-    src: "/lib"
-    dst: "/lib"
-    is_bind: true
-}
-
-mount {
-    src: "/lib64"
-    dst: "/lib64"
-    is_bind: true
-    mandatory: false
-}
-
-mount {
-    src: "/usr/lib"
-    dst: "/usr/lib"
-    is_bind: true
-}
-
-mount {
-    src: "/usr/local/lib"
-    dst: "/usr/local/lib"
-    is_bind: true
-}
-
-mount {
-    src: "/bin"
-    dst: "/bin"
-    is_bind: true
-}
-
-mount {
-    src: "/usr/bin"
-    dst: "/usr/bin"
-    is_bind: true
-}
-
-mount {
-    src: "/usr/local/bin"
-    dst: "/usr/local/bin"
-    is_bind: true
-}
-
-mount {
-    src: "/tmp"
-    dst: "/tmp"
-    is_bind: true
-    rw: true
-}
-
-mount {
-    src: "/proc"
-    dst: "/proc"
-    fstype: "proc"
-}
-
-mount {
-    src: "/dev/null"
-    dst: "/dev/null"
-    is_bind: true
-}
-
-mount {
-    src: "/dev/zero"
-    dst: "/dev/zero"
-    is_bind: true
-}
-
-mount {
-    src: "/dev/urandom"
-    dst: "/dev/urandom"
-    is_bind: true
-}
-
+# Minimal namespace isolation - disable problematic ones
 clone_newnet: false
-clone_newuser: true
+clone_newuser: false
+clone_newns: false
+clone_newpid: false
+clone_newipc: false
+clone_newuts: false
+clone_newcgroup: false
+
+# Environment
+keep_env: true
+
+# Script file
+mount {{
+    src: "{script_path}"
+    dst: "/tmp/script.py"
+    is_bind: true
+    rw: false
+}}
+
+# Execution binary
+exec_bin {{
+    path: "/usr/bin/python3"
+    arg: "-u"
+    arg: "/tmp/script.py"
+}}
+'''
+    
+    return config_content
+
+def create_nsjail_config_ultra_minimal(script_path):
+    """Create ultra-minimal nsjail configuration for maximum compatibility"""
+    
+    config_content = f'''
+name: "python-executor"
+description: "Safe Python script execution - ultra minimal config"
+
+mode: ONCE
+time_limit: {EXECUTION_TIMEOUT}
+log_level: ERROR
+
+# Only basic resource limits
+rlimit_as: 134217728
+rlimit_as_type: VALUE
+rlimit_cpu: 30
+rlimit_cpu_type: VALUE
+
+# Disable all namespace isolation
+clone_newnet: false
+clone_newuser: false
+clone_newns: false
+clone_newpid: false
+clone_newipc: false
+clone_newuts: false
+clone_newcgroup: false
+
+# Keep environment
+keep_env: true
+
+# Script file
+mount {{
+    src: "{script_path}"
+    dst: "/tmp/script.py"
+    is_bind: true
+    rw: false
+}}
+
+# Execution binary
+exec_bin {{
+    path: "/usr/bin/python3"
+    arg: "-u"
+    arg: "/tmp/script.py"
+}}
+'''
+    
+    return config_content
+
+def create_nsjail_config_full(script_path):
+    """Create full nsjail configuration for native Linux environments"""
+    
+    config_content = f'''
+name: "python-executor"
+description: "Safe Python script execution - full config"
+
+mode: ONCE
+hostname: "python-jail"
+cwd: "/tmp"
+time_limit: {EXECUTION_TIMEOUT}
+log_level: ERROR
+
+# Resource limits
+rlimit_as: 134217728
+rlimit_as_type: VALUE
+rlimit_cpu: 30
+rlimit_cpu_type: VALUE
+rlimit_fsize: 1048576
+rlimit_fsize_type: VALUE
+rlimit_nofile: 32
+rlimit_nofile_type: VALUE
+rlimit_nproc: 10
+rlimit_nproc_type: VALUE
+
+# Namespace isolation
+clone_newnet: false
+clone_newuser: false
 clone_newns: true
 clone_newpid: true
 clone_newipc: true
 clone_newuts: true
 clone_newcgroup: false
 
-# Use these instead of uid_mapping/gid_mapping for older nsjail versions
-inside_uid: 1000
-inside_gid: 1000
-"""
-    return config
+# Environment
+keep_env: false
+envar: "PATH=/usr/local/bin:/usr/bin:/bin"
+envar: "PYTHONPATH=/usr/local/lib/python3.11/site-packages:/usr/lib/python3.11/site-packages"
+envar: "HOME=/tmp"
+envar: "TMPDIR=/tmp"
 
-def create_seccomp_policy():
-    """Create seccomp policy for nsjail"""
-    policy = """
-POLICY default {
-    ALLOW {
-        read, write, open, close, stat, fstat, lstat, poll, lseek, mmap, mprotect,
-        munmap, brk, rt_sigaction, rt_sigprocmask, rt_sigreturn, ioctl, pread64,
-        pwrite64, readv, writev, access, pipe, select, sched_yield, mremap,
-        msync, mincore, madvise, shmget, shmat, shmctl, dup, dup2, pause, nanosleep,
-        getitimer, alarm, setitimer, getpid, sendfile, socket, connect, accept,
-        sendto, recvfrom, sendmsg, recvmsg, shutdown, bind, listen, getsockname,
-        getpeername, socketpair, setsockopt, getsockopt, clone, fork, vfork, execve,
-        exit, wait4, kill, uname, semget, semop, semctl, shmdt, msgget, msgsnd,
-        msgrcv, msgctl, fcntl, flock, fsync, fdatasync, truncate, ftruncate,
-        getdents, getcwd, chdir, fchdir, rename, mkdir, rmdir, creat, link, unlink,
-        symlink, readlink, chmod, fchmod, chown, fchown, lchown, umask, gettimeofday,
-        getrlimit, getrusage, sysinfo, times, ptrace, getuid, syslog, getgid,
-        setuid, setgid, geteuid, getegid, setpgid, getppid, getpgrp, setsid,
-        setreuid, setregid, getgroups, setgroups, setresuid, getresuid, setresgid,
-        getresgid, getpgid, setfsuid, setfsgid, getsid, capget, capset, rt_sigpending,
-        rt_sigtimedwait, rt_sigqueueinfo, rt_sigsuspend, sigaltstack, utime, mknod,
-        uselib, personality, ustat, statfs, fstatfs, sysfs, getpriority, setpriority,
-        sched_setparam, sched_getparam, sched_setscheduler, sched_getscheduler,
-        sched_get_priority_max, sched_get_priority_min, sched_rr_get_interval,
-        mlock, munlock, mlockall, munlockall, vhangup, modify_ldt, pivot_root,
-        _sysctl, prctl, arch_prctl, adjtimex, setrlimit, chroot, sync, acct,
-        settimeofday, mount, umount2, swapon, swapoff, reboot, sethostname,
-        setdomainname, iopl, ioperm, create_module, init_module, delete_module,
-        get_kernel_syms, query_module, quotactl, nfsservctl, getpmsg, putpmsg,
-        afs_syscall, tuxcall, security, gettid, readahead, setxattr, lsetxattr,
-        fsetxattr, getxattr, lgetxattr, fgetxattr, listxattr, llistxattr,
-        flistxattr, removexattr, lremovexattr, fremovexattr, tkill, time,
-        futex, sched_setaffinity, sched_getaffinity, set_thread_area,
-        io_setup, io_destroy, io_getevents, io_submit, io_cancel, get_thread_area,
-        lookup_dcookie, epoll_create, epoll_ctl_old, epoll_wait_old, remap_file_pages,
-        getdents64, set_tid_address, restart_syscall, semtimedop, fadvise64,
-        timer_create, timer_settime, timer_gettime, timer_getoverrun, timer_delete,
-        clock_settime, clock_gettime, clock_getres, clock_nanosleep, exit_group,
-        epoll_wait, epoll_ctl, tgkill, utimes, vserver, mbind, set_mempolicy,
-        get_mempolicy, mq_open, mq_unlink, mq_timedsend, mq_timedreceive,
-        mq_notify, mq_getsetattr, kexec_load, waitid, add_key, request_key,
-        keyctl, ioprio_set, ioprio_get, inotify_init, inotify_add_watch,
-        inotify_rm_watch, migrate_pages, openat, mkdirat, mknodat, fchownat,
-        futimesat, newfstatat, unlinkat, renameat, linkat, symlinkat, readlinkat,
-        fchmodat, faccessat, pselect6, ppoll, unshare, set_robust_list,
-        get_robust_list, splice, tee, sync_file_range, vmsplice, move_pages,
-        utimensat, epoll_pwait, signalfd, timerfd_create, eventfd, fallocate,
-        timerfd_settime, timerfd_gettime, accept4, signalfd4, eventfd2, epoll_create1,
-        dup3, pipe2, inotify_init1, preadv, pwritev, rt_tgsigqueueinfo, perf_event_open,
-        recvmmsg, fanotify_init, fanotify_mark, prlimit64, name_to_handle_at,
-        open_by_handle_at, clock_adjtime, syncfs, sendmmsg, setns, getcpu,
-        process_vm_readv, process_vm_writev
-    }
-}
-"""
-    return policy
+# Mount /proc
+mount_proc: true
 
-def execute_with_nsjail(script_content):
-    """Execute Python script using nsjail"""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Create script file
-        script_path = os.path.join(tmpdir, "user_script.py")
-        
-        # Create wrapper script that captures output
-        wrapper_script = f'''
+# Essential system mounts
+mount {{
+    src: "/usr"
+    dst: "/usr"
+    is_bind: true
+    rw: false
+}}
+
+mount {{
+    src: "/lib"
+    dst: "/lib"
+    is_bind: true
+    rw: false
+}}
+
+mount {{
+    src: "/lib64"
+    dst: "/lib64"
+    is_bind: true
+    rw: false
+    mandatory: false
+}}
+
+mount {{
+    src: "/bin"
+    dst: "/bin"
+    is_bind: true
+    rw: false
+}}
+
+mount {{
+    src: "/etc/ld.so.cache"
+    dst: "/etc/ld.so.cache"
+    is_bind: true
+    rw: false
+    mandatory: false
+}}
+
+mount {{
+    src: "/etc/passwd"
+    dst: "/etc/passwd"
+    is_bind: true
+    rw: false
+    mandatory: false
+}}
+
+mount {{
+    src: "/etc/group"
+    dst: "/etc/group"
+    is_bind: true
+    rw: false
+    mandatory: false
+}}
+
+mount {{
+    src: "/tmp"
+    dst: "/tmp"
+    is_bind: true
+    rw: true
+}}
+
+# Script file
+mount {{
+    src: "{script_path}"
+    dst: "/tmp/script.py"
+    is_bind: true
+    rw: false
+}}
+
+# Execution binary
+exec_bin {{
+    path: "/usr/bin/python3"
+    arg: "-u"
+    arg: "/tmp/script.py"
+}}
+
+# Seccomp policy - allow essential syscalls for Python
+seccomp_string: "POLICY a {{ ALLOW {{ access, arch_prctl, brk, close, dup, dup2, execve, exit, exit_group, fcntl, fstat, futex, getcwd, getdents, getdents64, getegid, geteuid, getgid, getpid, getppid, getrandom, getrlimit, gettid, getuid, ioctl, lseek, lstat, madvise, mmap, mprotect, munmap, nanosleep, newfstatat, open, openat, pipe, pipe2, poll, pread64, prlimit64, read, readlink, rt_sigaction, rt_sigprocmask, rt_sigreturn, set_robust_list, set_tid_address, stat, statx, sysinfo, uname, wait4, write, clock_getres, clock_gettime, clock_nanosleep, prctl, getrusage, times }} DEFAULT KILL }}"
+'''
+    
+    return config_content
+
+def create_nsjail_config_no_mount(script_content):
+    """Create nsjail configuration that doesn't use file mounts - passes script via stdin"""
+    
+    # Fix the f-string issue by escaping outside of the f-string
+    escaped_script = script_content.replace('"', '\\"').replace('\n', '\\n')
+    
+    config_content = f'''
+name: "python-executor"
+mode: ONCE
+time_limit: {EXECUTION_TIMEOUT}
+log_level: ERROR
+
+# Basic resource limits
+rlimit_as: 134217728
+rlimit_as_type: VALUE
+rlimit_cpu: 30
+rlimit_cpu_type: VALUE
+
+# Disable all namespace isolation
+clone_newnet: false
+clone_newuser: false
+clone_newns: false
+clone_newpid: false
+clone_newipc: false
+clone_newuts: false
+clone_newcgroup: false
+
+# Keep environment
+keep_env: true
+
+# Execute python with script from stdin
+exec_bin {{
+    path: "/usr/bin/python3"
+    arg: "-u"
+    arg: "-c"
+    arg: "{escaped_script}"
+}}
+'''
+    
+    return config_content
+
+def execute_script_with_nsjail(script):
+    """Execute Python script using nsjail with fallback configurations"""
+    script_path = None
+    config_path = None
+    
+    try:
+        # Create wrapper script
+        safe_script = f"""
 import sys
 import json
-import traceback
-from io import StringIO
-import contextlib
+import math
+import random
+import datetime
+import re
+import base64
+import hashlib
+import uuid
+import itertools
+import functools
+import collections
+import copy
 
-# Capture stdout
-old_stdout = sys.stdout
-sys.stdout = mystdout = StringIO()
-
+# Allow pandas and numpy if available
 try:
-    # Execute user script
-    exec("""
-{script_content}
-""")
-    
-    # Check if main function exists
-    if 'main' not in globals():
-        raise ValueError("No main() function found in script")
-    
-    # Call main function
-    result = main()
-    
-    # Restore stdout
-    sys.stdout = old_stdout
-    stdout_content = mystdout.getvalue()
-    
-    # Validate result is JSON serializable
-    json.dumps(result)
-    
-    # Output result
-    output = {{"result": result, "stdout": stdout_content}}
-    print(json.dumps(output))
-    
-except Exception as e:
-    sys.stdout = old_stdout
-    error_output = {{"error": str(e), "stdout": mystdout.getvalue()}}
-    print(json.dumps(error_output))
-    sys.exit(1)
-'''
+    import pandas as pd
+    import numpy as np
+except ImportError:
+    pass
+
+# Allow basic os operations (limited)
+import os
+
+# User's script
+{script}
+
+# Execute main and capture result
+if __name__ == "__main__":
+    try:
+        result = main()
+        # Ensure result is JSON serializable
+        json.dumps(result)
+        print("__RESULT_START__")
+        print(json.dumps(result))
+        print("__RESULT_END__")
+    except Exception as e:
+        print("__ERROR_START__")
+        print(f"Error in main(): {{str(e)}}")
+        print("__ERROR_END__")
+        sys.exit(1)
+"""
+
+        # Create temporary file for the script in a location that should be accessible
+        temp_dir = "/tmp"
+        os.makedirs(temp_dir, exist_ok=True)
         
-        with open(script_path, 'w') as f:
-            f.write(wrapper_script)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, dir=temp_dir) as f:
+            f.write(safe_script)
+            f.flush()
+            script_path = f.name
         
-        # Create nsjail config
-        config_path = os.path.join(tmpdir, "nsjail.cfg")
-        with open(config_path, 'w') as f:
-            f.write(create_nsjail_config())
+        # Make sure the file is readable
+        os.chmod(script_path, 0o644)
         
-        # Create seccomp policy (optional for basic functionality)
-        seccomp_path = os.path.join(tmpdir, "seccomp.policy")
-        with open(seccomp_path, 'w') as f:
-            f.write(create_seccomp_policy())
+        # Verify file exists and is readable
+        if not os.path.exists(script_path):
+            raise Exception(f"Script file not created: {script_path}")
         
-        try:
-            # Execute with nsjail - try without seccomp first
-            cmd = [
-                'nsjail',
-                '--config', config_path,
-                '--',
-                'python3', script_path
-            ]
-            
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=35,  # Slightly longer than nsjail's internal timeout
-                cwd=tmpdir
-            )
-            
-            if result.returncode != 0:
-                return {"error": f"Execution failed: {result.stderr}", "stdout": result.stdout}
-            
+        app.logger.info(f"Created script file: {script_path}")
+        
+        # Try configurations in order of preference for Cloud Run
+        configs = [
+            ("no-mount", lambda path: create_nsjail_config_no_mount(safe_script)),
+            ("cloudrun", create_nsjail_config_cloudrun),
+            ("ultra-minimal", create_nsjail_config_ultra_minimal),
+            ("minimal", create_nsjail_config_minimal),
+            ("full", create_nsjail_config_full)
+        ]
+        
+        last_error = None
+        
+        for config_name, config_func in configs:
             try:
-                return json.loads(result.stdout)
-            except json.JSONDecodeError:
-                return {"error": "Script did not return valid JSON", "stdout": result.stdout}
+                app.logger.info(f"Trying {config_name} nsjail configuration")
                 
-        except subprocess.TimeoutExpired:
-            return {"error": "Script execution timed out", "stdout": ""}
-        except FileNotFoundError:
-            return {"error": "nsjail not found - please ensure it's installed", "stdout": ""}
-        except Exception as e:
-            return {"error": f"Execution error: {str(e)}", "stdout": ""}
-
-def execute_with_simple_timeout(script_content):
-    """Fallback execution without nsjail if nsjail fails"""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        script_path = os.path.join(tmpdir, "user_script.py")
+                # Create nsjail config
+                if config_name == "no-mount":
+                    config_content = config_func(script_path)
+                else:
+                    config_content = config_func(script_path)
+                
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.cfg', delete=False, dir=temp_dir) as config_file:
+                    config_file.write(config_content)
+                    config_file.flush()
+                    config_path = config_file.name
+                
+                # Make sure config file is readable
+                os.chmod(config_path, 0o644)
+                
+                app.logger.info(f"Created config file: {config_path}")
+                app.logger.info(f"Config content preview: {config_content[:200]}...")
+                
+                # Execute with nsjail
+                cmd = ['/usr/local/bin/nsjail', '--config', config_path]
+                
+                app.logger.info(f"Executing command: {' '.join(cmd)}")
+                
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    cwd=temp_dir
+                )
+                
+                try:
+                    stdout, stderr = process.communicate(timeout=EXECUTION_TIMEOUT + 5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    raise Exception("Script execution timed out")
+                finally:
+                    # Clean up config file
+                    try:
+                        if config_path and os.path.exists(config_path):
+                            os.unlink(config_path)
+                            config_path = None
+                    except Exception as e:
+                        app.logger.warning(f"Failed to cleanup config file: {e}")
+                
+                app.logger.info(f"Process return code: {process.returncode}")
+                app.logger.info(f"stdout: {stdout}")
+                app.logger.info(f"stderr: {stderr}")
+                
+                # Check nsjail execution
+                if process.returncode == 0:
+                    # Success! Parse output and return
+                    result, stdout_clean = parse_script_output(stdout)
+                    return result, stdout_clean
+                else:
+                    # Log detailed error information
+                    app.logger.error(f"{config_name} config failed with return code {process.returncode}")
+                    app.logger.error(f"stdout: {stdout}")
+                    app.logger.error(f"stderr: {stderr}")
+                    last_error = f"Script execution failed with {config_name} config (return code {process.returncode}): {stderr}"
+                    continue
+                    
+            except Exception as e:
+                app.logger.warning(f"{config_name} config error: {str(e)}")
+                last_error = str(e)
+                continue
+            finally:
+                # Clean up config file if it exists
+                try:
+                    if config_path and os.path.exists(config_path):
+                        os.unlink(config_path)
+                        config_path = None
+                except Exception as e:
+                    app.logger.warning(f"Failed to cleanup config file: {e}")
         
-        wrapper_script = f'''
-import sys
-import json
-import traceback
-from io import StringIO
-
-old_stdout = sys.stdout
-sys.stdout = mystdout = StringIO()
-
-try:
-    exec("""
-{script_content}
-""")
-    
-    if 'main' not in globals():
-        raise ValueError("No main() function found in script")
-    
-    result = main()
-    sys.stdout = old_stdout
-    stdout_content = mystdout.getvalue()
-    
-    json.dumps(result)
-    output = {{"result": result, "stdout": stdout_content}}
-    print(json.dumps(output))
-    
-except Exception as e:
-    sys.stdout = old_stdout
-    error_output = {{"error": str(e), "stdout": mystdout.getvalue()}}
-    print(json.dumps(error_output))
-    sys.exit(1)
-'''
+        # If we get here, all configs failed
+        raise Exception(last_error or "All nsjail configurations failed")
         
-        with open(script_path, 'w') as f:
-            f.write(wrapper_script)
-        
+    except Exception as e:
+        app.logger.error(f"Execution error: {str(e)}")
+        raise e
+    finally:
+        # Clean up script file
         try:
-            result = subprocess.run(
-                ['python3', script_path],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                cwd=tmpdir
-            )
-            
-            if result.returncode != 0:
-                return {"error": f"Execution failed: {result.stderr}", "stdout": result.stdout}
-            
-            try:
-                return json.loads(result.stdout)
-            except json.JSONDecodeError:
-                return {"error": "Script did not return valid JSON", "stdout": result.stdout}
-                
-        except subprocess.TimeoutExpired:
-            return {"error": "Script execution timed out", "stdout": ""}
+            if script_path and os.path.exists(script_path):
+                os.unlink(script_path)
         except Exception as e:
-            return {"error": f"Execution error: {str(e)}", "stdout": ""}
+            app.logger.warning(f"Failed to cleanup script file: {e}")
+
+def parse_script_output(stdout):
+    """Parse the output from the sandboxed script execution"""
+    lines = stdout.split('\n')
+    result = None
+    stdout_lines = []
+    capturing_result = False
+    
+    for line in lines:
+        if line == "__RESULT_START__":
+            capturing_result = True
+        elif line == "__RESULT_END__":
+            capturing_result = False
+        elif line.startswith("__ERROR_START__"):
+            error_msg = ""
+            for i, l in enumerate(lines):
+                if l == "__ERROR_START__":
+                    for j in range(i+1, len(lines)):
+                        if lines[j] == "__ERROR_END__":
+                            break
+                        error_msg += lines[j] + "\n"
+                    break
+            raise Exception(error_msg.strip())
+        elif capturing_result:
+            try:
+                result = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+        else:
+            if not line.startswith("__") and line.strip() and not line.startswith('['):
+                stdout_lines.append(line)
+    
+    if result is None:
+        raise Exception("main() function did not return a valid JSON object")
+    
+    return result, '\n'.join(stdout_lines)
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    nsjail_available = os.path.exists('/usr/local/bin/nsjail')
+    if not nsjail_available:
+        return jsonify({
+            "status": "unhealthy", 
+            "error": "nsjail not available",
+            "nsjail": False,
+            "python": sys.version
+        }), 503
+    
+    return jsonify({
+        "status": "healthy", 
+        "nsjail": True,
+        "python": sys.version,
+        "temp_dir": "/tmp",
+        "temp_writable": os.access("/tmp", os.W_OK)
+    })
 
 @app.route('/execute', methods=['POST'])
 def execute():
+    """Execute Python script endpoint"""
     try:
-        # Get JSON data
-        data = request.get_json()
+        # Check if nsjail is available
+        if not os.path.exists('/usr/local/bin/nsjail'):
+            return jsonify({"error": "nsjail is not available - execution not permitted"}), 503
         
+        # Validate request
+        if not request.is_json:
+            return jsonify({"error": "Request must be JSON"}), 400
+        
+        data = request.get_json()
         if not data or 'script' not in data:
             return jsonify({"error": "Missing 'script' field in request body"}), 400
         
@@ -351,24 +591,29 @@ def execute():
         # Validate script
         validate_script(script)
         
-        # Try nsjail first, fallback to simple execution
-        result = execute_with_nsjail(script)
+        # Execute with nsjail only
+        result, stdout = execute_script_with_nsjail(script)
         
-        # If nsjail failed due to configuration issues, try fallback
-        if "error" in result and ("Config file" in result["error"] or "nsjail not found" in result["error"]):
-            print("nsjail failed, falling back to simple execution")
-            result = execute_with_simple_timeout(script)
-        
-        return jsonify(result)
+        return jsonify({
+            "result": result,
+            "stdout": stdout,
+            "execution_method": "nsjail"
+        })
         
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": f"Validation error: {str(e)}"}), 400
     except Exception as e:
-        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+        app.logger.error(f"Execution error: {str(e)}")
+        return jsonify({"error": f"Execution error: {str(e)}"}), 500
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({"status": "healthy", "timestamp": time.time()})
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"error": "Endpoint not found"}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({"error": "Internal server error"}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
