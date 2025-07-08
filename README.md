@@ -433,10 +433,6 @@ This ensures compatibility across different deployment environments.
 
 ---
 
-## 📋 Take-Home Challenge Submission
-**Cloud Run URL**: https://python-executor-551536072450.us-central1.run.app/execute
-**Time to Complete**: [4 hours]
-
 ### Verification Checklist
 - ✅ Single `docker run` command starts service locally
 - ✅ Cloud Run deployment accessible via public URL
